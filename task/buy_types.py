@@ -10,6 +10,13 @@ from typing import Callable, Generic, TypeVar
 
 @dataclass
 class BuyStreamState:
+    """Stream state, not a paid-ticket or multi-attendee completion ledger.
+
+    ``order_created`` means a valid order ID was returned and this stream stops
+    creating. ``order_result_unknown`` and ``needs_order_review`` also stop the
+    stream until the official order state has been checked.
+    """
+
     stage: str = "初始化"
     countdown: str = "-"
     countdown_seconds: int | None = None

@@ -32,6 +32,7 @@ from util.ErrorCodes import ErrorCodes
 from util.h2client.constants import H2CLIENT_CONNECTIONS_PER_SOURCE_IP
 from task.buy_helpers import (
     BASE_URL as base_url,
+    build_order_detail_payment_result,
     build_payment_result_with_fallback,
     build_token_payload as _build_token_payload,
     create_order_terminal_rule as _create_order_terminal_rule,
@@ -58,7 +59,11 @@ from task.buy_types import (
     RetryOutcome,
 )
 from util.request.BiliRequest import BiliRequest
-from util.request.exceptions import BiliConnectionError, BiliRateLimitError
+from util.request.exceptions import (
+    BiliConnectionError,
+    BiliOrderResultUnknownError,
+    BiliRateLimitError,
+)
 
 
 LOCAL_FANOUT_PROXY_STRATEGY = "local_fanout"
@@ -279,6 +284,7 @@ def _precheck_notifiers(notifier_config) -> None:
 
 def buy_stream(config: BuyConfig):
     state = BuyStreamState()
+    known_order_id: int | str | None = None
 
     def emit(
         kind: str,
@@ -295,6 +301,17 @@ def buy_stream(config: BuyConfig):
             message=message,
             state=copy.deepcopy(state),
             data=update.to_dict() if update is not None else {},
+        )
+
+    def stop_for_unknown_order(reason: str, *, attempt: int | None = None):
+        return emit(
+            "order_result_unknown",
+            f"创建订单结果尚未确认，已停止下单；请先核对官方订单中心。原因：{reason}",
+            BuyStreamUpdate(
+                status="order_result_unknown",
+                stage="订单结果待核实",
+                attempt_current=attempt,
+            ),
         )
 
     def emit_payment_details(
@@ -320,6 +337,89 @@ def buy_stream(config: BuyConfig):
             if value in (None, ""):
                 continue
             yield emit("payment_qr", f"{marker}={value}", update)
+
+    def emit_order_assistance(order_id: int | str, *, status: str, notify: bool):
+        """Payment UI and notifications never decide whether to create again."""
+        payment_result = build_order_detail_payment_result(order_id)
+        try:
+            payment_result, payment_error = build_payment_result_with_fallback(
+                _request, order_id
+            )
+            if payment_error is not None:
+                yield emit(
+                    "status",
+                    "未获取支付二维码，请在官方订单详情核对付款状态；保持停止下单",
+                    BuyStreamUpdate(order_id=order_id, status=status),
+                )
+        except Exception:
+            yield emit(
+                "status",
+                "支付信息处理失败，请在官方订单详情核对付款状态；保持停止下单",
+                BuyStreamUpdate(order_id=order_id, status=status),
+            )
+        yield from emit_payment_details(payment_result, status=status)
+
+        if config.auto_open_payment_url:
+            try:
+                webbrowser.open(payment_result["order_detail_url"])
+                yield emit(
+                    "status",
+                    "已自动打开订单详情链接",
+                    BuyStreamUpdate(order_id=order_id, status=status),
+                )
+            except Exception:
+                yield emit(
+                    "status",
+                    "自动打开订单链接失败，请手动查看官方订单中心；保持停止下单",
+                    BuyStreamUpdate(order_id=order_id, status=status),
+                )
+
+        if config.show_qrcode and payment_result.get("payment_code_url"):
+            try:
+                qr_gen = qrcode.QRCode()
+                qr_gen.add_data(payment_result["payment_code_url"])
+                qr_gen.make(fit=True)
+                qr_gen.make_image().show()
+            except Exception:
+                yield emit(
+                    "status",
+                    "显示支付二维码失败，请手动查看官方订单中心；保持停止下单",
+                    BuyStreamUpdate(order_id=order_id, status=status),
+                )
+
+        if not notify:
+            return
+        try:
+            notifier_manager = NotifierManager.create_from_config(
+                config=config.notifier_config,
+                title="订单已创建，待核对付款",
+                content=f"bilibili会员购，请前往官方订单中心核对并付款: {detail}",
+            )
+            notifier_manager.start_all()
+            # Keep synchronous delivery before stream exit, but notification
+            # failures must never re-enter the order creation loop.
+            notifier_manager.join_all(timeout=15)
+            notify_retries, notify_backoff = _resolve_notify_retry_params(
+                config.notifier_config
+            )
+            results = notifier_manager.send_all_sync(
+                title="订单已创建，待核对付款",
+                content=f"bilibili会员购，请前往官方订单中心核对并付款: {detail}",
+                retries=notify_retries,
+                backoff=notify_backoff,
+            )
+            if results and not any(results.values()):
+                yield emit(
+                    "status",
+                    "通知渠道发送失败，请手动查看官方订单中心；保持停止下单",
+                    BuyStreamUpdate(order_id=order_id, status=status),
+                )
+        except Exception:
+            yield emit(
+                "status",
+                "订单通知处理失败，请手动查看官方订单中心；保持停止下单",
+                BuyStreamUpdate(order_id=order_id, status=status),
+            )
 
     def handle_proxy_failure(
         reason: str,
@@ -724,21 +824,54 @@ def buy_stream(config: BuyConfig):
                             isJson=True,
                         )
                         ret = create_response.json()
+                        if not isinstance(ret, dict):
+                            yield stop_for_unknown_order(
+                                "创建响应不是对象", attempt=attempt
+                            )
+                            return
+                        raw_err = ret.get("errno", ret.get("code"))
+                        if isinstance(raw_err, bool) or not isinstance(
+                            raw_err, (int, str)
+                        ):
+                            yield stop_for_unknown_order(
+                                "创建响应缺少有效结果码", attempt=attempt
+                            )
+                            return
+                        try:
+                            err = int(raw_err)
+                        except ValueError:
+                            yield stop_for_unknown_order(
+                                "创建响应结果码无法解析", attempt=attempt
+                            )
+                            return
                         proxy_backoff.reset()
-                        err = int(ret.get("errno", ret.get("code")))
                         retry_outcome.set_response(err, ret)
-                        _request.handle_100001(err)
                         if _is_create_success(ret, err):
+                            known_order_id = _extract_order_id(ret)
+                            payment_result = build_order_detail_payment_result(
+                                known_order_id
+                            )
+                            result = (ret, err)
                             yield emit(
-                                "success",
-                                "创建订单成功",
+                                "order_created",
+                                "订单已创建，请核对官方订单并付款；本任务已停止下单",
                                 BuyStreamUpdate(
+                                    order_id=known_order_id,
+                                    order_detail_url=payment_result["order_detail_url"],
+                                    payment_qr_url=payment_result["payment_qr_url"],
+                                    status="order_created",
+                                    stage="订单已创建，待核对付款",
                                     attempt_current=attempt,
                                     attempt_total=effective_retry_limit,
                                 ),
                             )
-                            result = (ret, err)
                             break
+                        if err == 0:
+                            yield stop_for_unknown_order(
+                                "成功码未伴随可信的有效订单号", attempt=attempt
+                            )
+                            return
+                        _request.handle_100001(err)
                         yield emit(
                             "attempt",
                             ErrorCodes.format_attempt_result(err, ret),
@@ -761,6 +894,7 @@ def buy_stream(config: BuyConfig):
                                     attempt_current=attempt,
                                     attempt_total=effective_retry_limit,
                                     status=terminal_rule.status,
+                                    stage="待核对官方订单",
                                 ),
                             )
                             break
@@ -779,14 +913,31 @@ def buy_stream(config: BuyConfig):
                             )
                             tickets_info["pay_money"] = ret["data"]["pay_money"]
                         should_sleep_before_next_attempt = True
-                    except JSONDecodeError as exc:
-                        handled_412 = yield from handle_non_json_response(
-                            "创建订单接口",
-                            create_response,
-                            attempt=attempt,
+                    except BiliOrderResultUnknownError:
+                        yield stop_for_unknown_order(
+                            "提交后的网络响应不确定", attempt=attempt
                         )
-                        if not handled_412:
-                            retry_outcome.set_exception(exc)
+                        return
+                    except JSONDecodeError:
+                        yield stop_for_unknown_order(
+                            "创建响应不是有效 JSON", attempt=attempt
+                        )
+                        return
+                    except BiliConnectionError as e:
+                        # For create POSTs the request layer only uses this
+                        # exception when the default transport has not sent
+                        # the request. Possibly sent failures use the distinct
+                        # BiliOrderResultUnknownError and must never reach here.
+                        retry_outcome.set_exception(e)
+                        yield emit(
+                            "attempt",
+                            "连接失败，创建请求尚未发送；按请求间隔继续尝试",
+                            BuyStreamUpdate(
+                                attempt_current=attempt,
+                                attempt_total=effective_retry_limit,
+                            ),
+                        )
+                        should_sleep_before_next_attempt = True
                     except BiliRateLimitError as e:
                         retry_outcome.set_exception(e)
                         yield emit(
@@ -805,31 +956,26 @@ def buy_stream(config: BuyConfig):
                             time.sleep(rate_limit_delay_ms / 1000)
                         continue  # 不需要sleep
                     except RequestException as e:
-                        retry_outcome.set_exception(e)
-                        for message in handle_proxy_failure(
-                            f"创建订单请求异常({e.__class__.__name__})",
-                            attempt=attempt,
-                        ):
-                            yield message
-                        yield emit(
-                            "attempt",
-                            str(e),
-                            BuyStreamUpdate(
-                                attempt_current=attempt,
-                                attempt_total=effective_retry_limit,
-                            ),
+                        yield stop_for_unknown_order(
+                            f"创建请求异常({e.__class__.__name__})", attempt=attempt
                         )
+                        return
                     except Exception as e:
-                        logger.exception(e)
-                        retry_outcome.set_exception(e)
-                        yield emit(
-                            "attempt",
-                            str(e),
-                            BuyStreamUpdate(
-                                attempt_current=attempt,
-                                attempt_total=effective_retry_limit,
-                            ),
-                        )
+                        if known_order_id is not None:
+                            yield emit(
+                                "status",
+                                "订单号已取得，后续处理异常；保持停止下单，请核对官方订单",
+                                BuyStreamUpdate(
+                                    order_id=known_order_id,
+                                    status="order_created",
+                                ),
+                            )
+                        else:
+                            yield stop_for_unknown_order(
+                                f"创建响应处理异常({e.__class__.__name__})",
+                                attempt=attempt,
+                            )
+                        return
                     finally:
                         attempt += 1
 
@@ -875,49 +1021,20 @@ def buy_stream(config: BuyConfig):
                     errno, terminal_ret, terminal_rule = terminal_result
                     order_id = _extract_order_id(terminal_ret)
                     if terminal_rule.expose_payment_url and order_id is not None:
-                        payment_result, payment_error = (
-                            build_payment_result_with_fallback(_request, order_id)
-                        )
-                        if payment_error is not None:
+                        try:
+                            yield from emit_order_assistance(
+                                order_id, status=terminal_rule.status, notify=False
+                            )
+                        except Exception:
                             yield emit(
                                 "status",
-                                "订单已创建，但未获取到支付二维码；该订单可能无需付款，"
-                                f"将继续返回订单详情页: {payment_error}",
+                                "现有订单的辅助处理失败，请核对官方订单；保持停止下单",
                                 BuyStreamUpdate(
-                                    order_id=payment_result["order_id"],
-                                    order_detail_url=payment_result["order_detail_url"],
-                                    payment_qr_url=payment_result["payment_qr_url"],
+                                    order_id=order_id,
                                     status=terminal_rule.status,
                                 ),
                             )
-                        for payment_event in emit_payment_details(
-                            payment_result,
-                            status=terminal_rule.status,
-                        ):
-                            yield payment_event
-                        if config.auto_open_payment_url:
-                            try:
-                                webbrowser.open(payment_result["order_detail_url"])
-                                yield emit(
-                                    "status",
-                                    "已自动打开现有订单链接",
-                                    BuyStreamUpdate(
-                                        order_id=payment_result.get("order_id"),
-                                        order_detail_url=payment_result.get(
-                                            "order_detail_url"
-                                        ),
-                                        payment_code_url=payment_result.get(
-                                            "payment_code_url"
-                                        ),
-                                        payment_qr_url=payment_result.get(
-                                            "payment_qr_url"
-                                        ),
-                                        status=terminal_rule.status,
-                                    ),
-                                )
-                            except Exception as exc:
-                                yield emit("status", f"自动打开订单链接失败: {exc}")
-                    break
+                    return
                 reason = _format_retry_reason(retry_outcome)
                 yield emit(
                     "status",
@@ -925,85 +1042,28 @@ def buy_stream(config: BuyConfig):
                 )
                 yield emit_reprepare(reason)
                 continue
-            # win了
-            request_result, errno = result
-            if errno == 0:
-                notifierManager = NotifierManager.create_from_config(
-                    config=config.notifier_config,
-                    title="抢票成功",
-                    content=f"bilibili会员购，请尽快前往订单中心付款: {detail}",
-                )
-
-                notifierManager.start_all()
-
-                yield emit(
-                    "stage",
-                    "抢票成功，弹出付款二维码",
-                    BuyStreamUpdate(
-                        stage="抢票成功",
-                        status="succeeded",
-                    ),
-                )
-                order_id = request_result["data"]["orderId"]  # type: ignore
-                payment_result, payment_error = build_payment_result_with_fallback(
-                    _request, order_id
-                )
-                if payment_error is not None:
+            # A valid order ID was latched before any optional assistance. No
+            # notification, browser or QR failure may return to creation.
+            if known_order_id is not None:
+                try:
+                    yield from emit_order_assistance(
+                        known_order_id, status="order_created", notify=True
+                    )
+                except Exception:
                     yield emit(
                         "status",
-                        "订单已创建，但未获取到支付二维码；该订单可能无需付款，"
-                        f"将继续返回订单详情页: {payment_error}",
+                        "订单号已取得，辅助处理异常；保持停止下单，请核对官方订单",
                         BuyStreamUpdate(
-                            order_id=payment_result["order_id"],
-                            order_detail_url=payment_result["order_detail_url"],
-                            payment_qr_url=payment_result["payment_qr_url"],
-                            status="succeeded",
+                            order_id=known_order_id,
+                            status="order_created",
                         ),
                     )
-                for payment_event in emit_payment_details(
-                    payment_result,
-                    status="succeeded",
-                ):
-                    yield payment_event
-                if config.auto_open_payment_url:
-                    try:
-                        webbrowser.open(payment_result["order_detail_url"])
-                        yield emit(
-                            "status",
-                            "已自动打开支付链接",
-                            BuyStreamUpdate(
-                                order_id=payment_result.get("order_id"),
-                                order_detail_url=payment_result.get("order_detail_url"),
-                                payment_code_url=payment_result.get("payment_code_url"),
-                                payment_qr_url=payment_result.get("payment_qr_url"),
-                                status="succeeded",
-                            ),
-                        )
-                    except Exception as exc:
-                        yield emit("status", f"自动打开支付链接失败: {exc}")
-                if config.show_qrcode and payment_result.get("payment_code_url"):
-                    qr_gen = qrcode.QRCode()
-                    qr_gen.add_data(payment_result["payment_code_url"])
-                    qr_gen.make(fit=True)
-                    qr_gen_image = qr_gen.make_image()
-                    qr_gen_image.show()  # type: ignore
-                # 让 Server酱/Bark/PushPlus 等渠道的 daemon 线程有时间持续重发。
-                notifierManager.join_all(timeout=15)
-                # 关键：退出前做一次同步阻塞发送（带 timeout+重试），确认送达再退出。
-                # 不依赖 daemon 线程——UI 模式 os._exit(0) 会硬杀 daemon 线程，导致丢失。
-                # 本调用发生在生成器 yield 完成、buy_cmd 退出（含 os._exit）之前。
-                notify_retries, notify_backoff = _resolve_notify_retry_params(
-                    config.notifier_config
-                )
-                results = notifierManager.send_all_sync(
-                    title="抢票成功",
-                    content=f"bilibili会员购，请尽快前往订单中心付款: {detail}",
-                    retries=notify_retries,
-                    backoff=notify_backoff,
-                )
-                if results and not any(results.values()):
-                    logger.error("所有通知渠道同步发送均失败，请检查推送配置或网络。")
-                break
+                return
+            yield stop_for_unknown_order("创建结果缺少有效订单号")
+            return
+        except BiliOrderResultUnknownError:
+            yield stop_for_unknown_order("提交后的网络响应不确定")
+            return
         except (HTTPError, RequestException) as e:
             logger.exception(e)
             yield emit("error", f"请求错误: {e}")

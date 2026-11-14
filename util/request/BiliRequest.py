@@ -15,7 +15,11 @@ from util.request.BrowerState import (
     generate_browser_fingerprint_state,
 )
 from util.request.CookieManager import CookieManager
-from util.request.exceptions import BiliConnectionError, BiliRateLimitError
+from util.request.exceptions import (
+    BiliConnectionError,
+    BiliOrderResultUnknownError,
+    BiliRateLimitError,
+)
 from util.proxy.ProxyManager import ProxyManager
 import urllib.parse
 import random
@@ -248,28 +252,67 @@ class BiliRequest:
             )
         return client.get(url, params=data)
 
+    @staticmethod
+    def _is_create_order_request(method: str, url: str) -> bool:
+        # Match the route used by prepare_create_request, not query text or a
+        # substring shared by unrelated endpoints (including order/prepare).
+        parsed = urllib.parse.urlsplit(str(url))
+        return (
+            method.lower() == "post"
+            and parsed.scheme == "https"
+            and parsed.hostname == "show.bilibili.com"
+            and urllib.parse.unquote(parsed.path) == "/api/ticket/order/createV2"
+        )
+
     def _send_with_h2_recovery(self, method: str, url, data=None, isJson=False):
         import httpx
 
+        is_create_order = self._is_create_order_request(method, url)
         for attempt in range(2):
             try:
                 return self._h2_send(method, url, data=data, isJson=isJson)
-            except httpx.TimeoutException as exc:
-                self._invalidate_h2_client()
-                if attempt >= 1:
-                    raise BiliConnectionError(
-                        "网络请求超时：服务器响应过慢，请稍后重试",
+            except httpx.RequestError as exc:
+                # Only the default HTTPX transport gives these errors their
+                # documented pre-send meaning. Custom clients can, for example,
+                # map an OSError after sending to ConnectError; never replay an
+                # order on that assumption. Custom transports/redirect options
+                # also need their own proof before being considered safe.
+                failed_before_send = (
+                    self._h2_client_type in (None, httpx.Client)
+                    and not self._h2_client_options
+                    and isinstance(
+                        exc,
+                        (httpx.ConnectTimeout, httpx.ConnectError, httpx.PoolTimeout),
+                    )
+                )
+                if is_create_order and not failed_before_send:
+                    self._invalidate_h2_client()
+                    raise BiliOrderResultUnknownError(
+                        "创建订单请求结果不明，可能已生成订单；已停止自动重试，"
+                        "请先到会员购订单中心核实。",
                         cause=exc,
                     ) from exc
-                loguru.logger.warning("HTTP 请求超时，已重建连接后重试: {}", exc)
-            except httpx.LocalProtocolError as exc:
+
+                if is_create_order and failed_before_send:
+                    message = "创建订单前连接失败：请求尚未发送，请稍后重试"
+                    retry_message = "创建订单前连接失败，已重建连接后重试: {}"
+                elif isinstance(exc, httpx.TimeoutException):
+                    message = "网络请求超时：服务器响应过慢，请稍后重试"
+                    retry_message = "HTTP 请求超时，已重建连接后重试: {}"
+                elif isinstance(exc, httpx.LocalProtocolError):
+                    message = (
+                        "网络连接异常：HTTP/2 连接已断开，重试后仍失败，请稍后再试"
+                    )
+                    retry_message = "HTTP/2 连接状态异常，已重建连接后重试: {}"
+                else:
+                    # Preserve existing recovery policy for other operations;
+                    # this is not a declaration that arbitrary POSTs are safe.
+                    raise
+
                 self._invalidate_h2_client()
                 if attempt >= 1:
-                    raise BiliConnectionError(
-                        "网络连接异常：HTTP/2 连接已断开，重试后仍失败，请稍后再试",
-                        cause=exc,
-                    ) from exc
-                loguru.logger.warning("HTTP/2 连接状态异常，已重建连接后重试: {}", exc)
+                    raise BiliConnectionError(message, cause=exc) from exc
+                loguru.logger.warning(retry_message, exc)
 
     def _request(self, method: str, url, data=None, isJson=False):
         response = self._send_with_h2_recovery(

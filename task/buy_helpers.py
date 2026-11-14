@@ -333,17 +333,17 @@ def normalize_prepare_ptoken(value: str | None) -> str:
 
 CREATE_ORDER_TERMINAL_RULES: dict[int, CreateOrderTerminalRule] = {
     100003: CreateOrderTerminalRule(
-        status="completed",
-        message="该项目每人限购1张，已存在购买订单，停止重试",
+        status="needs_order_review",
+        message="平台返回限购或已有购买订单，请核对购买资格与官方订单，停止重试",
     ),
     100048: CreateOrderTerminalRule(
-        status="completed",
-        message="有尚未完成订单，停止重试",
+        status="needs_order_review",
+        message="有尚未完成订单，请核对官方订单及待付款状态，停止重试",
         expose_payment_url=True,
     ),
     100079: CreateOrderTerminalRule(
-        status="completed",
-        message="有重复订单，停止重试",
+        status="needs_order_review",
+        message="有重复订单，请核对官方订单，停止重试",
     ),
 }
 
@@ -354,7 +354,11 @@ def create_order_terminal_rule(err: int) -> CreateOrderTerminalRule | None:
 
 def is_create_success(ret: dict, err: int) -> bool:
     resp_message = str(ret.get("msg", ret.get("message", "")) or "")
-    return err == 0 and "defaultBBR" not in resp_message
+    return (
+        err == 0
+        and "defaultBBR" not in resp_message
+        and extract_order_id(ret) is not None
+    )
 
 
 def extract_order_id(ret: dict | None) -> int | str | None:
@@ -364,7 +368,15 @@ def extract_order_id(ret: dict | None) -> int | str | None:
     if not isinstance(data, dict):
         return None
     order_id = data.get("orderId")
-    return order_id if order_id not in (None, "", 0) else None
+    # A boolean, float, negative value or arbitrary string is not an order ID.
+    # Keep decimal strings as strings, including large IDs, without float coercion.
+    if isinstance(order_id, int) and not isinstance(order_id, bool):
+        return order_id if order_id > 0 else None
+    if isinstance(order_id, str):
+        order_id = order_id.strip()
+        if order_id.isascii() and order_id.isdecimal() and order_id.strip("0"):
+            return order_id
+    return None
 
 
 def extract_response_message(ret: dict) -> str:

@@ -49,6 +49,11 @@ def _heartbeat_loop(
 def main(run_dir_arg: str) -> int:
     from app_cmd.config.BuyConfig import BuyConfig
     from interface.config import RuntimeOptions
+    from interface.execution import (
+        ORDER_OUTCOME_STATUSES,
+        _collect_payment_fields_from_event,
+        _order_outcome_from_event,
+    )
     from task.buy import Buy
 
     run_dir = Path(run_dir_arg)
@@ -106,38 +111,23 @@ def main(run_dir_arg: str) -> int:
     try:
         for event in buy_job.stream():
             message = event.message
-            if message is not None:
-                _append_log(logs_path, message)
             with status_lock:
                 status["updated_at"] = time.time()
+                final_status = _order_outcome_from_event(event, final_status)
+                status.update(_collect_payment_fields_from_event(event))
+                if final_status in ORDER_OUTCOME_STATUSES:
+                    status["status"] = final_status
                 if message is not None:
                     status["last_message"] = message
-                    if "抢票成功" in message:
-                        final_status = "succeeded"
-                    if "有重复订单" in message:
-                        final_status = "duplicate_order"
-                    payment_state = event.state
-                    for key in (
-                        "payment_qr_url",
-                        "order_id",
-                        "order_detail_url",
-                        "payment_code_url",
-                    ):
-                        value = getattr(payment_state, key, None)
-                        if value not in (None, ""):
-                            status[key] = value
-                    if message.startswith("PAYMENT_QR_URL="):
-                        status["payment_qr_url"] = message.split("=", 1)[1]
-                    elif message.startswith("ORDER_ID="):
-                        status["order_id"] = message.split("=", 1)[1]
-                    elif message.startswith("ORDER_DETAIL_URL="):
-                        status["order_detail_url"] = message.split("=", 1)[1]
-                    elif message.startswith("PAYMENT_CODE_URL="):
-                        status["payment_code_url"] = message.split("=", 1)[1]
                 _dump_json(status_path, status)
+            if message is not None:
+                _append_log(logs_path, message)
     except BaseException as exc:
+        failure_status = (
+            final_status if final_status in ORDER_OUTCOME_STATUSES else "failed"
+        )
         with status_lock:
-            status["status"] = "failed"
+            status["status"] = failure_status
             status["error"] = repr(exc)
             status["last_message"] = "RUNNER_EXCEPTION={0!r}".format(exc)
             status["updated_at"] = time.time()
@@ -149,7 +139,7 @@ def main(run_dir_arg: str) -> int:
             {
                 "ok": False,
                 "run_id": metadata["run_id"],
-                "status": "failed",
+                "status": failure_status,
                 "error": repr(exc),
                 "payment_qr_url": status["payment_qr_url"],
                 "order_id": status["order_id"],

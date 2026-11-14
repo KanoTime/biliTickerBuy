@@ -19,6 +19,42 @@ from .types import BuyTaskRecord
 _TASKS: dict[str, BuyTaskRecord] = {}
 _TASKS_LOCK = threading.Lock()
 
+# These are outcomes of an order attempt, not proof of payment or goal completion.
+ORDER_OUTCOME_STATUSES = frozenset(
+    {"order_created", "order_result_unknown", "needs_order_review"}
+)
+TERMINAL_RUN_STATUSES = ORDER_OUTCOME_STATUSES | {
+    "succeeded",
+    "completed",
+    "duplicate_order",
+    "failed",
+    "cancelled",
+}
+
+
+def _order_outcome_from_event(event: Any, current: str) -> str:
+    """Use structured order evidence; never infer success from log wording."""
+    if current in ORDER_OUTCOME_STATUSES:
+        return current
+    state = getattr(event, "state", None)
+    outcome = getattr(state, "status", None)
+    if outcome in {"order_created", "succeeded"}:
+        order_id = getattr(state, "order_id", None)
+        valid_id = (
+            isinstance(order_id, int)
+            and not isinstance(order_id, bool)
+            and order_id > 0
+        ) or (
+            isinstance(order_id, str)
+            and order_id.isascii()
+            and order_id.isdigit()
+            and bool(order_id.lstrip("0"))
+        )
+        return "order_created" if valid_id else "order_result_unknown"
+    if outcome in ORDER_OUTCOME_STATUSES:
+        return outcome
+    return current
+
 
 def _collect_payment_fields_from_event(event: Any) -> dict[str, Any]:
     result: dict[str, Any] = {}
@@ -110,6 +146,19 @@ def _update_managed_status(
     return status
 
 
+def _managed_run_pid(run_dir: Path, status: dict[str, Any]) -> int | None:
+    """The parent records its PID separately from the child's status writes."""
+    pid = status.get("pid")
+    if isinstance(pid, int) and not isinstance(pid, bool) and pid > 0:
+        return pid
+    metadata_path = run_dir / "run.json"
+    if metadata_path.exists():
+        pid = _load_json(metadata_path).get("pid")
+        if isinstance(pid, int) and not isinstance(pid, bool) and pid > 0:
+            return pid
+    return None
+
+
 def _pid_is_running(pid: int | None) -> bool:
     if not isinstance(pid, int) or pid <= 0:
         return False
@@ -124,19 +173,24 @@ def _pid_is_running(pid: int | None) -> bool:
             pid,
         )
         if not handle:
-            return False
+            # Access denied or another query failure cannot prove process exit.
+            # ERROR_INVALID_PARAMETER means the requested PID does not exist.
+            return ctypes.windll.kernel32.GetLastError() != 87
         try:
             exit_code = ctypes.c_ulong()
             if not ctypes.windll.kernel32.GetExitCodeProcess(
                 handle,
                 ctypes.byref(exit_code),
             ):
-                return False
+                return True
             return exit_code.value == still_active
         finally:
             ctypes.windll.kernel32.CloseHandle(handle)
     try:
         os.kill(pid, 0)
+    except PermissionError:
+        # Lack of permission is not evidence that deletion is safe.
+        return True
     except (OSError, SystemError):
         return False
     return True
@@ -152,6 +206,25 @@ def _terminate_pid(pid: int) -> None:
         )
         return
     os.kill(pid, signal.SIGTERM)
+
+
+def _wait_for_pid_exit(pid: int, *, timeout_seconds: float = 2.0) -> bool:
+    deadline = time.monotonic() + timeout_seconds
+    while True:
+        if os.name != "nt":
+            try:
+                # Reap a child started by this API; kill(pid, 0) alone would
+                # still report an exited but unreaped child as running.
+                reaped_pid, _ = os.waitpid(pid, os.WNOHANG)
+                if reaped_pid == pid:
+                    return True
+            except (ChildProcessError, OSError):
+                pass
+        if not _pid_is_running(pid):
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.05)
 
 
 def _build_managed_failure_result(
@@ -200,45 +273,50 @@ def _mark_managed_run_failed(
     return status
 
 
-def _reconcile_managed_run(run_dir: Path, status: dict[str, Any]) -> dict[str, Any]:
+def _reconcile_managed_run(
+    run_dir: Path,
+    status: dict[str, Any],
+    *,
+    process_stopped: bool = False,
+) -> dict[str, Any]:
     current_status = status.get("status")
-    if current_status in {
-        "succeeded",
-        "completed",
-        "duplicate_order",
-        "failed",
-        "cancelled",
-    }:
+    if current_status in TERMINAL_RUN_STATUSES:
         return status
 
-    pid = status.get("pid")
-    if _pid_is_running(pid):
+    pid = _managed_run_pid(run_dir, status)
+    if not process_stopped and pid is None:
+        # Startup may still be between Popen and the parent's metadata write.
+        return status
+    if not process_stopped and _pid_is_running(pid):
         updated_at = status.get("updated_at")
         heartbeat_timeout = _heartbeat_timeout_seconds(status)
         if (
             isinstance(updated_at, (int, float))
             and time.time() - float(updated_at) > heartbeat_timeout
         ):
-            return _mark_managed_run_failed(
-                run_dir,
-                run_id=status["run_id"],
-                error="managed runner heartbeat timed out after {0:.1f}s".format(
+            # Do not race a live child's next order/status write. A stale
+            # heartbeat is a process-health warning, not an order outcome.
+            return {
+                **status,
+                "heartbeat_stale": True,
+                "runner_warning": "managed runner heartbeat timed out after {0:.1f}s".format(
                     heartbeat_timeout
                 ),
-            )
+            }
+        return status
+
+    # A status query may have read "running" just before the child published
+    # its final order outcome and exited. Re-read after confirming exit so a
+    # stale snapshot cannot replace that evidence with a synthetic failure.
+    status = _load_json(run_dir / "status.json")
+    if status.get("status") in TERMINAL_RUN_STATUSES:
         return status
 
     result_path = run_dir / "result.json"
     if result_path.exists():
         result = _load_json(result_path)
         terminal_status = result.get("status")
-        if terminal_status in {
-            "succeeded",
-            "completed",
-            "duplicate_order",
-            "failed",
-            "cancelled",
-        }:
+        if terminal_status in TERMINAL_RUN_STATUSES:
             fields: dict[str, Any] = {
                 "status": terminal_status,
                 "finished_at": status.get("finished_at") or time.time(),
@@ -297,29 +375,29 @@ def _run_buy_task(
         ),
     )
     _update_task(task_id, status="running", started_at=time.time())
-    succeeded = False
+    final_status = "completed"
     try:
         for event in buy_job.stream():
             message = event.message
-            if message is None:
-                continue
-            _append_log(task_id, message)
-            if "抢票成功" in message:
-                succeeded = True
+            if message is not None:
+                _append_log(task_id, message)
+            final_status = _order_outcome_from_event(event, final_status)
             payment_fields = _collect_payment_fields_from_event(event)
+            if final_status in ORDER_OUTCOME_STATUSES:
+                payment_fields["status"] = final_status
             if payment_fields:
                 _update_task(task_id, **payment_fields)
 
         _update_task(
             task_id,
-            status="succeeded" if succeeded else "completed",
+            status=final_status,
             finished_at=time.time(),
         )
     except Exception as exc:
         _append_log(task_id, "task exception: {0!r}".format(exc))
         _update_task(
             task_id,
-            status="failed",
+            status=final_status if final_status in ORDER_OUTCOME_STATUSES else "failed",
             finished_at=time.time(),
             error=repr(exc),
         )
@@ -404,34 +482,44 @@ def run_buy_sync(
     order_id: int | str | None = None
     order_detail_url: str | None = None
     payment_code_url: str | None = None
-    succeeded = False
-    for event in buy_job.stream():
-        message = event.message
-        if message is None:
-            continue
-        logs.append(message)
-        if "抢票成功" in message:
-            succeeded = True
-        payment_fields = _collect_payment_fields_from_event(event)
-        if "payment_qr_url" in payment_fields:
-            payment_qr_url = payment_fields["payment_qr_url"]
-        if "order_id" in payment_fields:
-            order_id = payment_fields["order_id"]
-        if "order_detail_url" in payment_fields:
-            order_detail_url = payment_fields["order_detail_url"]
-        if "payment_code_url" in payment_fields:
-            payment_code_url = payment_fields["payment_code_url"]
+    final_status = "completed"
+    error: str | None = None
+    try:
+        for event in buy_job.stream():
+            message = event.message
+            if message is not None:
+                logs.append(message)
+            final_status = _order_outcome_from_event(event, final_status)
+            payment_fields = _collect_payment_fields_from_event(event)
+            if "payment_qr_url" in payment_fields:
+                payment_qr_url = payment_fields["payment_qr_url"]
+            if "order_id" in payment_fields:
+                order_id = payment_fields["order_id"]
+            if "order_detail_url" in payment_fields:
+                order_detail_url = payment_fields["order_detail_url"]
+            if "payment_code_url" in payment_fields:
+                payment_code_url = payment_fields["payment_code_url"]
+    except Exception as exc:
+        if final_status not in ORDER_OUTCOME_STATUSES:
+            raise
+        # Preserve known order evidence even if a stream consumer or optional
+        # follow-up fails; callers must not infer that a new purchase is safe.
+        error = repr(exc)
+        logs.append("task exception: {0!r}".format(exc))
 
-    return {
-        "ok": True,
+    result = {
+        "ok": error is None,
         "validation": validation.to_dict(),
-        "status": "succeeded" if succeeded else "completed",
+        "status": final_status,
         "logs": logs,
         "payment_qr_url": payment_qr_url,
         "order_id": order_id,
         "order_detail_url": order_detail_url,
         "payment_code_url": payment_code_url,
     }
+    if error is not None:
+        result["error"] = error
+    return result
 
 
 def start_managed_buy(
@@ -532,21 +620,11 @@ def start_managed_buy(
             creationflags=creationflags,
             startupinfo=startupinfo,
         )
-    finally:
-        stdout_handle.close()
-        stderr_handle.close()
-
-    status["pid"] = process.pid
-    status["updated_at"] = time.time()
-    _dump_json(run_dir / "status.json", status)
-
-    time.sleep(0.2)
-    returncode = process.poll()
-    if returncode is not None:
+    except OSError as exc:
         failed_status = _mark_managed_run_failed(
             run_dir,
             run_id=assigned_run_id,
-            error="managed runner exited immediately with code {0}".format(returncode),
+            error="managed runner could not start: {0}".format(exc),
         )
         return {
             "ok": False,
@@ -554,19 +632,41 @@ def start_managed_buy(
             "run": failed_status,
             "error": failed_status.get("error"),
         }
+    finally:
+        stdout_handle.close()
+        stderr_handle.close()
 
-    return {
-        "ok": True,
+    # The child can already have published an order outcome. Never overwrite
+    # status.json with the parent's stale pending snapshot after Popen.
+    run_metadata["pid"] = process.pid
+    _dump_json(run_dir / "run.json", run_metadata)
+
+    time.sleep(0.2)
+    returncode = process.poll()
+    status = _load_json(run_dir / "status.json")
+    if returncode is not None:
+        status = _reconcile_managed_run(run_dir, status, process_stopped=True)
+
+    result = {
+        "ok": status.get("status") != "failed" and returncode in (None, 0),
         "validation": validation.to_dict(),
         "run": {
+            **status,
             "run_id": assigned_run_id,
             "run_dir": str(run_dir),
             "status_path": str(run_dir / "status.json"),
             "result_path": str(run_dir / "result.json"),
             "logs_path": str(run_dir / "events.log"),
             "pid": process.pid,
+            "process_running": returncode is None,
+            "returncode": returncode,
         },
     }
+    if not result["ok"]:
+        result["error"] = status.get("error") or (
+            "managed runner exited with code {0}".format(returncode)
+        )
+    return result
 
 
 def managed_task_status(
@@ -602,55 +702,101 @@ def cancel_managed_buy(
         return {"ok": False, "error": "managed run not found", "run_id": run_id}
 
     status = _load_json(status_path)
-    current_status = status.get("status")
-    if current_status in {
-        "succeeded",
-        "completed",
-        "duplicate_order",
-        "failed",
-        "cancelled",
-    }:
+    if status.get("status") in TERMINAL_RUN_STATUSES and (
+        status.get("finished_at") is not None
+        or status.get("process_stopped_at") is not None
+    ):
+        # A finished run's historical PID may now belong to another process.
+        # An order outcome without finished_at can still have live assistance;
+        # only that unfinished runner is eligible for termination below.
         return {
             "ok": True,
             "run": status,
-            "cancelled": current_status == "cancelled",
-            "message": "run already finished",
+            "cancelled": status.get("status") == "cancelled",
+            "message": "run already finished; historical PID was not signalled",
+        }
+    pid = _managed_run_pid(run_dir, status)
+    if pid is None and status.get("status") not in TERMINAL_RUN_STATUSES:
+        return {
+            "ok": False,
+            "run": status,
+            "cancelled": False,
+            "error": "managed runner PID is not yet available; retry after startup",
         }
 
-    pid = status.get("pid")
     process_was_running = _pid_is_running(pid)
     if process_was_running:
         assert pid is not None
-        _terminate_pid(pid)
+        try:
+            _terminate_pid(pid)
+        except ProcessLookupError:
+            pass
+        except OSError as exc:
+            return {
+                "ok": False,
+                "run": _load_json(status_path),
+                "cancelled": False,
+                "error": "could not stop managed runner: {0}".format(exc),
+            }
+        if not _wait_for_pid_exit(pid):
+            return {
+                "ok": False,
+                "run": _load_json(status_path),
+                "cancelled": False,
+                "process_stopped": False,
+                "error": "managed runner has not exited; order state was preserved",
+            }
 
-    updated_status = _update_managed_status(
-        run_dir,
-        status="cancelled",
-        finished_at=time.time(),
-        error=None,
-        last_message="cancelled by API",
-    )
-
+    # The runner may publish an order while termination is in progress. Re-read
+    # only after it has stopped, so neither its outcome nor its last write is lost.
+    status = _load_json(status_path)
     result_path = run_dir / "result.json"
-    _dump_json(
-        result_path,
-        {
-            "ok": False,
-            "run_id": run_id,
-            "status": "cancelled",
-            "payment_qr_url": updated_status.get("payment_qr_url"),
-            "order_id": updated_status.get("order_id"),
-            "order_detail_url": updated_status.get("order_detail_url"),
-            "payment_code_url": updated_status.get("payment_code_url"),
-            "logs_path": updated_status.get("logs_path"),
-            "last_message": "cancelled by API",
-        },
-    )
+    if status.get("status") not in TERMINAL_RUN_STATUSES and result_path.exists():
+        status = _reconcile_managed_run(run_dir, status, process_stopped=True)
+
+    current_status = status.get("status")
+    if current_status in TERMINAL_RUN_STATUSES:
+        updated_status = status
+        if process_was_running:
+            updated_status = _update_managed_status(
+                run_dir,
+                finished_at=status.get("finished_at") or time.time(),
+                process_stopped_at=time.time(),
+            )
+    else:
+        updated_status = _update_managed_status(
+            run_dir,
+            status="cancelled",
+            finished_at=time.time(),
+            process_stopped_at=time.time(),
+            error=None,
+            last_message="cancelled by API",
+        )
+
+    # If assistance was stopped before result.json existed, retain the same
+    # order outcome there too. Existing terminal results remain untouched.
+    if not result_path.exists() or current_status not in TERMINAL_RUN_STATUSES:
+        _dump_json(
+            result_path,
+            {
+                "ok": updated_status.get("status") in ORDER_OUTCOME_STATUSES,
+                "run_id": run_id,
+                "status": updated_status.get("status"),
+                "payment_qr_url": updated_status.get("payment_qr_url"),
+                "order_id": updated_status.get("order_id"),
+                "order_detail_url": updated_status.get("order_detail_url"),
+                "payment_code_url": updated_status.get("payment_code_url"),
+                "logs_path": updated_status.get("logs_path"),
+                "last_message": updated_status.get("last_message"),
+                "error": updated_status.get("error"),
+            },
+        )
     return {
         "ok": True,
         "run": updated_status,
-        "cancelled": True,
+        "cancelled": updated_status.get("status") == "cancelled",
         "process_was_running": process_was_running,
+        "process_stopped": True,
     }
 
 
@@ -670,7 +816,14 @@ def delete_managed_buy(
 
     status_path = run_dir / "status.json"
     status = _load_json(status_path) if status_path.exists() else {}
-    pid = status.get("pid")
+    pid = _managed_run_pid(run_dir, status)
+    if pid is None and status.get("status") not in TERMINAL_RUN_STATUSES:
+        return {
+            "ok": False,
+            "error": "managed runner PID is not yet available; cannot confirm it stopped",
+            "run_id": run_id,
+            "run": status,
+        }
     process_is_running = _pid_is_running(pid)
 
     if process_is_running and not force:
@@ -684,6 +837,25 @@ def delete_managed_buy(
     cancelled = None
     if process_is_running and force:
         cancelled = cancel_managed_buy(run_id, runs_root=runs_root)
+        if not cancelled.get("ok"):
+            return {
+                "ok": False,
+                "error": cancelled.get("error", "managed runner could not be stopped"),
+                "run_id": run_id,
+                "cancelled": cancelled,
+            }
+
+    # A terminal order state or successful cancellation response alone is not
+    # proof that the process has exited. Never remove a live runner's files.
+    status = _load_json(status_path) if status_path.exists() else status
+    if _pid_is_running(_managed_run_pid(run_dir, status)):
+        return {
+            "ok": False,
+            "error": "managed runner is still running; run files were preserved",
+            "run_id": run_id,
+            "run": status,
+            "cancelled": cancelled,
+        }
 
     shutil.rmtree(run_dir)
     return {
