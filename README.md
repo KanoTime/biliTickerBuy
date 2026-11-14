@@ -32,6 +32,10 @@
 
 请查看完整的 [安装指南](./docs/installation.md)。
 
+## 固定三人目标与自动回流
+
+本 fork 的个人目标版本使用独立入口 `python -m app_cmd.goal`，支持两个账号共用购票人状态、三人优先、分批补齐、回流等待和重启恢复。先运行离线演示，再按[本机使用指南](./docs/personal-goal.md)配置和进行只读预检。该入口的自动订单核验仍需结合当前账号回包验证，详见[接口证据与边界](./docs/goal-api-evidence.md)。
+
 ## 👀 使用说明书
 
 前往飞书： https://n1x87b5cqay.feishu.cn/wiki/Eg4xwt3Dbiah02k1WqOcVk2YnMd

@@ -24,6 +24,7 @@ main.dist
 .DS_Store
 bilitickerbuy.egg-info
 btb_runs
+btb_goal_data/
 confirmOrder.*.js
 dev
 local_overrides/

@@ -49,26 +49,22 @@ This protects the wrapper's retry boundary. It does not make the server operatio
 idempotent and does not remove internal concurrent sends from the optional
 `local_fanout` client. It is not a global exactly-once guarantee.
 
-## Scope of this patch
+## Personal goal integration
 
-The following are still separate implementation work:
+The separate [personal goal entry point](personal-goal.md) now adds a durable
+SQLite attendee ledger, submission intents, cross-account reservations, explicit
+group-size reduction, fixed target/price checks, and a returning-stock loop. Its
+bounded adapter reuses the prepare/create helpers and this transport protection.
 
-- A durable purchase-goal ledger keyed by the real attendee and admission target,
-  shared across account executors.
-- Saving a submission intent before the network call, reconciling uncertain
-  orders, and recovering safely after a process or machine restart.
-- Coordinating multiple accounts so their submitted attendee sets never overlap.
-- Trying the preferred group size first, then using only explicitly authorized
-  smaller groups after a confirmed no-order stock shortage, with a fresh prepare
-  for each account/person/count change.
-- Automatically continuing the same goal for returning inventory and purchasing
-  only attendees who are neither fulfilled nor reserved by an unresolved order.
-- Fixed target and price checks. The existing `100034` branch can still update
-  `pay_money` from the response; it has not been changed here.
+The legacy `Buy`/UI entry point is still a single-task flow. Its per-run status
+files are not the shared goal ledger, and its `100034` price-update branch remains
+unchanged. The personal-goal adapter stops on a price change and does not use
+`local_fanout`. Use the goal entry point for coordinated multi-account behavior.
 
-The per-run status files introduced or updated by the runner are not that shared
-goal ledger. Starting a second independent process or clearing those files is
-not an order-reconciliation mechanism.
+The goal ledger preserves unknown submissions on restart. Automatic recognition
+is currently limited to known, durably bound order IDs with sufficient matching
+platform fields. Unknown candidates and insufficient query schemas require an
+explicit local official-order check; see the [API evidence](goal-api-evidence.md).
 
 ## Verification
 

@@ -1,0 +1,46 @@
+# 本场个人目标模板。先复制到自己的本机目录，再填写占位信息。
+# 两份会员购导出 JSON 都应预选同样的三个人，并保存在本机；不要提交到 Git。
+# 本模板不包含 Cookie、姓名、证件或真实账号 UID，不会直接用于下单。
+schema_version = 1
+people = ["P1", "P2", "P3"]
+
+# 均为北京时间，必须带 +08:00。结束时刻由你自己的守候/付款安排决定。
+starts_at = "2026-11-15T18:00:00+08:00"
+ends_at = ""
+interval_seconds = 1.0
+order_poll_seconds = 10.0
+# 路径相对于本 TOML 文件；生成到 btb_goal_data/goal.toml 时仍只使用同一目录。
+state_path = "goal.sqlite3"
+
+[target]
+project_id = 1006859
+# 2026-11-14 23:29 +08:00 无登录公开详情快照；运行时仍复核日期、票档与价格。
+# 来源与字段摘录：docs/fes-target-20261114.md。
+screen_id = 1035758
+sku_id = 960028
+admission_date = "2026-11-28"
+# 核对普通票在平台上的实际完整名称；不得替换成快速票或套票。
+ticket_name = "普通入场券"
+price_cents = 19800
+
+[[accounts]]
+key = "A"
+uid = "FILL_ACCOUNT_A_UID"
+config_path = "account-a.json"
+# 只有你在本机核对过此账号 P1/P2/P3 分别是谁后才改成 true。
+# 姓名相同、证件尾号相同不构成自动匹配依据。
+mapping_confirmed = false
+[accounts.buyer_ids]
+P1 = "FILL_ACCOUNT_A_P1_BUYER_ID"
+P2 = "FILL_ACCOUNT_A_P2_BUYER_ID"
+P3 = "FILL_ACCOUNT_A_P3_BUYER_ID"
+
+[[accounts]]
+key = "B"
+uid = "FILL_ACCOUNT_B_UID"
+config_path = "account-b.json"
+mapping_confirmed = false
+[accounts.buyer_ids]
+P1 = "FILL_ACCOUNT_B_P1_BUYER_ID"
+P2 = "FILL_ACCOUNT_B_P2_BUYER_ID"
+P3 = "FILL_ACCOUNT_B_P3_BUYER_ID"
