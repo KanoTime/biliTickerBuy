@@ -42,6 +42,8 @@ NAV_URL = "https://api.bilibili.com/x/web-interface/nav"
 BUYERS_URL = f"{BASE_URL}/api/ticket/buyer/list"
 ORDER_INFO_URL = f"{BASE_URL}/api/ticket/order/info"
 ORDER_LIST_URL = f"{BASE_URL}/api/ticket/order/list"
+IDENTITY_CACHE_SECONDS = 30.0
+_AUTH_REQUIRED_CODES = {-101, -111, 100044}
 
 
 def _integer(value: Any) -> int | None:
@@ -168,6 +170,7 @@ class BiliGoalAccount:
         target: GoalTarget,
         *,
         request: Any = None,
+        monotonic: Callable[[], float] = time.monotonic,
     ) -> None:
         self.account = account
         self.target = target
@@ -185,6 +188,18 @@ class BiliGoalAccount:
         self._hot_project = False
         self._preflight_retryable = False
         self._preflight_delay = 3.0
+        self._monotonic = monotonic
+        self._uid_checked_at: float | None = None
+        self._buyers_checked_at: dict[str, float] = {}
+
+    def _clear_identity_checks(self) -> None:
+        self._uid_checked_at = None
+        self._buyers_checked_at.clear()
+
+    def _check_is_fresh(self, checked_at: float | None) -> bool:
+        return checked_at is not None and (
+            0 <= self._monotonic() - checked_at < IDENTITY_CACHE_SECONDS
+        )
 
     @staticmethod
     def _body(response: Any) -> dict[str, Any]:
@@ -197,21 +212,36 @@ class BiliGoalAccount:
             raise _CheckFailure(f"只读校验返回 HTTP {status}", retryable=status >= 500)
         body = response.json()
         if not isinstance(body, dict):
-            raise _CheckFailure("平台返回的校验结构无法识别")
+            raise _CheckFailure("平台返回的校验结构暂时无法识别", retryable=True)
         return body
 
-    def _login_uid(self) -> str:
+    @staticmethod
+    def _read_success(body: dict[str, Any]) -> None:
+        code = _code(body)
+        if code in _AUTH_REQUIRED_CODES:
+            raise _CheckFailure("平台要求重新登录或完成验证，请到官方页面处理")
+        if code != 0:
+            raise _CheckFailure("平台暂未返回有效的只读校验结果", retryable=True)
+
+    def _login_uid(self, *, force: bool = False) -> str:
+        if not force and self._check_is_fresh(self._uid_checked_at):
+            return self.account.uid
+        self._uid_checked_at = None
         body = self._body(self._request.get(url=NAV_URL))
+        self._read_success(body)
         data = body.get("data")
-        if (
-            _code(body) != 0
-            or not isinstance(data, dict)
-            or data.get("isLogin") is not True
-        ):
+        if not isinstance(data, dict):
+            raise _CheckFailure("登录状态结构暂时无法识别", retryable=True)
+        if data.get("isLogin") is False:
             raise _CheckFailure("账号未处于已验证登录状态，请重新登录")
+        if data.get("isLogin") is not True:
+            raise _CheckFailure("登录状态暂时无法确认", retryable=True)
         uid = _id(data.get("mid"))
+        if uid is None:
+            raise _CheckFailure("登录 UID 暂时无法确认", retryable=True)
         if uid != self.account.uid:
             raise _CheckFailure("实际登录 UID 与本机账号映射不符")
+        self._uid_checked_at = self._monotonic()
         return uid
 
     def _target_check(self) -> None:
@@ -224,11 +254,13 @@ class BiliGoalAccount:
             if guard.blocked is not None:
                 raise guard.blocked
             raise
+        if _integer(project.get("id")) is None:
+            raise _CheckFailure("平台活动 ID 暂时无法确认", retryable=True)
         if _integer(project.get("id")) != self.target.project_id:
             raise _CheckFailure("平台活动 ID 与固定目标不符", scope="goal")
         screens = project.get("screen_list")
         if not isinstance(screens, list):
-            raise _CheckFailure("平台未返回可核对的场次列表", scope="goal")
+            raise _CheckFailure("平台暂未返回可核对的场次列表", retryable=True)
         matches = [
             s
             for s in screens
@@ -245,13 +277,13 @@ class BiliGoalAccount:
             ),
             None,
         )
+        if date is None:
+            raise _CheckFailure("平台场次日期暂时无法核实", retryable=True)
         if date != self.target.admission_date:
-            raise _CheckFailure(
-                "平台场次日期与固定入场日期不符或无法核实", scope="goal"
-            )
+            raise _CheckFailure("平台场次日期与固定入场日期不符", scope="goal")
         tickets = screen.get("ticket_list")
         if not isinstance(tickets, list):
-            raise _CheckFailure("平台未返回可核对的票档列表", scope="goal")
+            raise _CheckFailure("平台暂未返回可核对的票档列表", retryable=True)
         matches = [
             t
             for t in tickets
@@ -260,8 +292,12 @@ class BiliGoalAccount:
         if len(matches) != 1:
             raise _CheckFailure("固定票档不存在或不唯一", scope="goal")
         ticket = matches[0]
+        if not isinstance(ticket.get("desc"), str) or not ticket["desc"].strip():
+            raise _CheckFailure("平台票档名称暂时无法确认", retryable=True)
         if str(ticket.get("desc", "")).strip() != self.target.ticket_name:
             raise _CheckFailure("平台票档名称与固定目标不符", scope="goal")
+        if _integer(ticket.get("price")) is None:
+            raise _CheckFailure("平台票面单价暂时无法确认", retryable=True)
         if _integer(ticket.get("price")) != self.target.price_cents:
             raise _CheckFailure("平台票面单价与固定金额不符", scope="goal")
         for item in (screen, ticket):
@@ -283,21 +319,30 @@ class BiliGoalAccount:
         self._ticket = copy.deepcopy(ticket)
         self._hot_project = bool(project.get("hotProject"))
 
-    def _buyers_check(self) -> None:
+    def _buyers_check(self, people: tuple[str, ...], *, force: bool = False) -> None:
+        to_check = tuple(
+            person
+            for person in people
+            if force or not self._check_is_fresh(self._buyers_checked_at.get(person))
+        )
+        if not to_check:
+            return
+        for person in to_check:
+            self._buyers_checked_at.pop(person, None)
         body = self._body(
             self._request.get(
                 url=f"{BUYERS_URL}?is_default&projectId={self.target.project_id}"
             )
         )
-        if _code(body) != 0 or not isinstance(body.get("data"), dict):
-            raise _CheckFailure("无法核对该账号的购票人列表")
+        self._read_success(body)
+        if not isinstance(body.get("data"), dict):
+            raise _CheckFailure("暂时无法核对该账号的购票人列表", retryable=True)
         buyers = body["data"].get("list")
         if not isinstance(buyers, list):
-            raise _CheckFailure("平台购票人列表结构无法识别")
-        expected = self.account.payload_for(tuple(self.account.buyer_ids), self.target)[
-            "buyer_info"
-        ]
-        for person, buyer_id in self.account.buyer_ids.items():
+            raise _CheckFailure("平台购票人列表结构暂时无法识别", retryable=True)
+        expected = self.account.payload_for(to_check, self.target)["buyer_info"]
+        for person in to_check:
+            buyer_id = self.account.buyer_ids[person]
             matches = [
                 buyer
                 for buyer in buyers
@@ -307,6 +352,13 @@ class BiliGoalAccount:
                 raise _CheckFailure(f"购票人 {person} 的账号映射不存在或不唯一")
             live = matches[0]
             stored = next(buyer for buyer in expected if _buyer_id(buyer) == buyer_id)
+            if any(
+                not isinstance(live.get(field), str) or not live[field].strip()
+                for field in ("name", "personal_id")
+            ):
+                raise _CheckFailure(
+                    f"购票人 {person} 的实名字段暂时无法核对", retryable=True
+                )
             if any(
                 str(live.get(field, "")).strip() != str(stored.get(field, "")).strip()
                 for field in ("name", "personal_id")
@@ -318,18 +370,34 @@ class BiliGoalAccount:
                 raise _CheckFailure(f"购票人 {person} 不属于当前账号映射")
             if "error_code" in live and _integer(live["error_code"]) != 0:
                 raise _CheckFailure(f"平台提示购票人 {person} 的信息需要处理")
+        checked_at = self._monotonic()
+        self._buyers_checked_at.update(dict.fromkeys(to_check, checked_at))
 
-    def preflight(self) -> PreflightResult:
-        """Read-only identity, current target, price, and attendee checks."""
+    def preflight(
+        self, *, person_keys: tuple[str, ...] | None = None
+    ) -> PreflightResult:
+        """Force fresh read-only checks; None checks all, () skips attendees."""
+        people = tuple(self.account.buyer_ids) if person_keys is None else person_keys
+        return self._preflight(people, force=True)
+
+    def _preflight(self, people: tuple[str, ...], *, force: bool) -> PreflightResult:
         self._ticket = {}
         self._preflight_retryable = False
         self._preflight_delay = 3.0
         try:
-            uid = self._login_uid()
+            if (
+                not isinstance(people, tuple)
+                or not all(isinstance(person, str) for person in people)
+                or len(set(people)) != len(people)
+                or not set(people).issubset(self.account.buyer_ids)
+            ):
+                raise GoalConfigError("本次核验的人组不符合固定账号映射")
+            uid = self._login_uid(force=force)
             self._target_check()
-            self._buyers_check()
+            self._buyers_check(people, force=force)
             return PreflightResult(True, account_uid=uid)
         except _CheckFailure as exc:
+            self._clear_identity_checks()
             self._preflight_retryable = exc.retryable
             return PreflightResult(
                 False,
@@ -339,8 +407,10 @@ class BiliGoalAccount:
                 retry_after=self._preflight_delay if exc.retryable else 0.0,
             )
         except GoalConfigError as exc:
+            self._clear_identity_checks()
             return PreflightResult(False, reason=str(exc), blocked_scope="goal")
         except BiliRateLimitError as exc:
+            self._clear_identity_checks()
             self._preflight_retryable = True
             self._preflight_delay = _retry_after(exc.response)
             return PreflightResult(
@@ -350,6 +420,7 @@ class BiliGoalAccount:
                 retry_after=self._preflight_delay,
             )
         except Exception as exc:
+            self._clear_identity_checks()
             self._preflight_retryable = True
             # Exception strings can contain request details; only expose class.
             return PreflightResult(
@@ -418,11 +489,22 @@ class BiliGoalAccount:
                 reason="需在官方页面完成登录或验证",
                 definitive_no_order=True,
             )
-        if code in {100016, 100017, 100039}:
+        if code in {100016, 100017}:
+            # "Not currently saleable" does not establish that the event has
+            # ended or disclose a stock count. The coordinator owns the fixed
+            # stop window; a later attempt must refresh the same target.
+            return AttemptResult(
+                "retry",
+                code=code,
+                reason="固定目标当前不可售，保持原人数等待后刷新售卖状态",
+                retry_after=5.0,
+                definitive_no_order=True,
+            )
+        if code == 100039:
             return AttemptResult(
                 "blocked",
                 code=code,
-                reason="平台提示固定目标不可售，需核对售卖状态",
+                reason="平台明确提示活动已结束",
                 definitive_no_order=True,
                 blocked_scope="goal",
             )
@@ -445,7 +527,7 @@ class BiliGoalAccount:
         self, person_keys: tuple[str, ...], before_submit: Callable[[], None]
     ) -> AttemptResult:
         people = tuple(person_keys)
-        preflight = self.preflight()
+        preflight = self._preflight(people, force=False)
         if not preflight.ready:
             return AttemptResult(
                 "retry" if self._preflight_retryable else "blocked",
@@ -495,7 +577,10 @@ class BiliGoalAccount:
             )
             prepared = self._body(response)
             if _code(prepared) != 0:
-                return self._failure(prepared, before_create=True)
+                result = self._failure(prepared, before_create=True)
+                if result.outcome in {"blocked", "review"}:
+                    self._clear_identity_checks()
+                return result
             data = prepared.get("data")
             if not isinstance(data, dict):
                 raise _CheckFailure("准备订单响应缺少数据")
@@ -518,6 +603,7 @@ class BiliGoalAccount:
             )
             self._validate_payload(payload, people)
         except _CheckFailure as exc:
+            self._clear_identity_checks()
             return AttemptResult(
                 "retry" if exc.retryable else "blocked",
                 reason=str(exc),
@@ -565,7 +651,10 @@ class BiliGoalAccount:
                 return AttemptResult(
                     "unknown", code=0, reason="成功码缺少可信的有效订单号"
                 )
-            return self._failure(body, before_create=False)
+            result = self._failure(body, before_create=False)
+            if result.outcome in {"blocked", "review"}:
+                self._clear_identity_checks()
+            return result
         except BiliConnectionError:
             return AttemptResult(
                 "retry",
@@ -677,6 +766,9 @@ class BiliGoalAccount:
             response = self._body(
                 self._request.get(url=f"{ORDER_INFO_URL}?order_id={order_id}")
             )
+            if _code(response) in _AUTH_REQUIRED_CODES:
+                self._clear_identity_checks()
+                return unknown
             if _code(response) == 0:
                 observation = self._known_order_observation(
                     response.get("data"), attempt
@@ -688,6 +780,9 @@ class BiliGoalAccount:
             response = self._body(
                 self._request.get(url=f"{ORDER_LIST_URL}?page=0&page_size=20")
             )
+            if _code(response) in _AUTH_REQUIRED_CODES:
+                self._clear_identity_checks()
+                return unknown
             data = response.get("data")
             if (
                 _code(response) == 0
@@ -704,7 +799,7 @@ class BiliGoalAccount:
                     if observation is not None:
                         return observation
         except Exception:
-            pass
+            self._clear_identity_checks()
         return unknown
 
     def close(self) -> None:

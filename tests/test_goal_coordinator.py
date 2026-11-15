@@ -19,10 +19,12 @@ class FakeAccount:
         self.calls = []
         self.observations = {}
         self.preflight_calls = 0
+        self.preflight_groups = []
         self.closed = False
 
-    def preflight(self):
+    def preflight(self, *, person_keys=None):
         self.preflight_calls += 1
+        self.preflight_groups.append(person_keys)
         if isinstance(self.preflight_result, Exception):
             raise self.preflight_result
         return self.preflight_result
@@ -134,6 +136,8 @@ def test_shortage_then_pair_and_single_only_completes_on_verified_payment(scenar
     s.accounts["B"].observations["202"] = observation(
         s, ("P1", "P2"), account="B", order_id="202"
     )
+    one_verified = s.advance()
+    assert 0 < one_verified["counts"]["paid"] < 3
     complete = s.advance()
     assert complete["complete"] is True
     assert complete["stop_reason"] == "completed"
@@ -241,7 +245,11 @@ def test_verified_closed_order_releases_roster_and_returns_to_waiting(scenario):
         s, s.config.people, status="closed"
     )
     s.accounts["A"].actions = [AttemptResult("sold_out", definitive_no_order=True)]
+    s.coordinator.batch_cap = 1
     s.start()
+    result = s.coordinator.step()
+    assert result["counts"]["available"] == 3
+    assert s.coordinator._wait_seconds() == 0
     result = s.coordinator.step()
     assert s.accounts["A"].calls == [s.config.people]
     assert result["counts"]["available"] == 3
@@ -350,6 +358,7 @@ def test_transient_preflight_failure_defers_without_persistently_stopping_goal(
     scenario,
 ):
     s = scenario
+    s.config.starts_at = datetime.fromtimestamp(103, timezone.utc)
     for account in s.accounts.values():
         account.preflight_result = PreflightResult(
             False, "temporary rate limit", retryable=True, retry_after=5
@@ -411,3 +420,168 @@ def test_candidate_order_hint_does_not_bind_unverified_order_to_goal(scenario):
     # explicitly confirm that the present attempt never created an order.
     s.ledger.complete(record["attempt_id"], "no_order", reason="user_verified:no_order")
     assert s.ledger.available_people() == s.config.people
+
+
+def test_single_success_restores_remaining_pair_preference(scenario):
+    s = scenario
+    s.accounts["A"].actions = [
+        AttemptResult("shortage", code=100009, definitive_no_order=True),
+        AttemptResult("created", order_id=101),
+    ]
+    s.accounts["B"].actions = [
+        AttemptResult("shortage", code=100009, definitive_no_order=True),
+        AttemptResult("created", order_id=202),
+    ]
+    s.start()
+    s.coordinator.step()
+    s.advance()
+    s.advance()
+    snapshot = s.advance()
+    assert s.accounts["A"].calls == [s.config.people, ("P1",)]
+    assert s.accounts["B"].calls == [("P1", "P2"), ("P2", "P3")]
+    assert snapshot["counts"]["pending"] == 3
+    assert snapshot["counts"]["available"] == 0
+
+
+def test_resume_preflight_only_checks_remaining_people(scenario):
+    s = scenario
+    known_order(s, ("P1", "P2"), state="paid")
+    s.config.starts_at = datetime.fromtimestamp(105, timezone.utc)
+    s.start()
+    assert all(account.preflight_groups == [("P3",)] for account in s.accounts.values())
+
+
+@pytest.mark.parametrize("start", [90, 101])
+def test_open_sale_does_not_wait_for_backup_preflight(scenario, start):
+    s = scenario
+    s.config.starts_at = datetime.fromtimestamp(start, timezone.utc)
+
+    def first_preflight(*, person_keys):
+        assert person_keys == s.config.people
+        s.clock[0] += 2
+        return PreflightResult(True, account_uid="101")
+
+    s.accounts["A"].preflight = first_preflight
+    s.accounts["B"].preflight = lambda **_: pytest.fail(
+        "backup delayed the first order"
+    )
+    s.accounts["A"].actions = [AttemptResult("created", order_id=101)]
+    s.start()
+    s.coordinator.step()
+    assert s.accounts["A"].calls == [s.config.people]
+    assert s.clock[0] == 102
+    assert any(event["kind"] == "account_preflight_deferred" for event in s.events)
+
+
+def test_available_person_is_attempted_before_slow_existing_order_read(scenario):
+    s = scenario
+    known_order(s, ("P1", "P2"))
+    sequence = []
+
+    def create(people, before_submit):
+        assert people == ("P3",)
+        before_submit()
+        sequence.append("create-B")
+        return AttemptResult("created", order_id=600)
+
+    def slow_read(record):
+        sequence.append("read-A")
+        s.clock[0] += 5
+        return OrderObservation("unknown", reason="waiting for readable evidence")
+
+    s.accounts["B"].actions = [create]
+    s.accounts["A"].reconcile = slow_read
+    s.start()
+    s.coordinator.step()
+    assert sequence == ["create-B", "read-A"]
+    assert s.coordinator.next_order_poll_at == 106
+    s.coordinator.step()
+    assert sequence == ["create-B", "read-A"]
+
+
+def test_only_one_order_is_polled_per_round_and_accounts_rotate(scenario):
+    s = scenario
+    known_order(s, ("P1",), order_id=501)
+    known_order(s, ("P2",), account="B", order_id=502)
+    calls = []
+
+    def reconcile(record):
+        calls.append(record["account_key"])
+        return OrderObservation("unknown", reason="evidence unavailable")
+
+    for account in s.accounts.values():
+        account.reconcile = reconcile
+    s.start()
+    s.coordinator.step()
+    assert calls == ["A"]
+    s.advance()
+    assert calls == ["A", "B"]
+    s.advance()
+    assert calls == ["A", "B", "A"]
+    assert s.ledger.available_people() == ("P3",)
+
+
+def test_insufficient_verification_notice_is_actionable_and_deduplicated(scenario):
+    s = scenario
+    attempt = known_order(s, s.config.people)
+    s.accounts["A"].observations["500"] = OrderObservation(
+        "unknown", reason="payment fields missing"
+    )
+    s.start()
+    s.coordinator.step()
+    s.advance()
+    notices = [
+        event for event in s.events if event["kind"] == "order_verification_needed"
+    ]
+    assert len(notices) == 1
+    assert notices[0]["reason"] == "payment fields missing"
+    assert notices[0]["account_key"] == "A"
+    assert notices[0]["person_keys"] == list(s.config.people)
+    assert notices[0]["order_id"] == "500"
+    assert notices[0]["attempt_id"] == attempt
+    assert "stop → confirm → run --resume" in notices[0]["action"]
+    assert s.ledger.snapshot()["counts"]["pending"] == 3
+
+
+@pytest.mark.parametrize(
+    "outcome,code,kind",
+    [("retry", 100001, "waiting"), ("review", 100048, "order_unresolved")],
+)
+def test_result_events_preserve_business_code_and_attempt_timing(
+    scenario, outcome, code, kind
+):
+    s = scenario
+
+    def attempt(people, before_submit):
+        s.clock[0] += 0.25
+        before_submit()
+        s.clock[0] += 0.5
+        return AttemptResult(outcome, code=code, definitive_no_order=outcome == "retry")
+
+    s.accounts["A"].actions = [attempt]
+    s.start()
+    s.coordinator.step()
+    event = next(event for event in s.events if event["kind"] == kind)
+    assert event["code"] == code
+    assert event["duration_seconds"] == 0.75
+    assert event["submission_authorized_at"] == 100.25
+
+
+@pytest.mark.parametrize("deadline", ["start", "attempt", "account", "poll", "end"])
+def test_wait_uses_fractional_deadlines_instead_of_whole_second_delay(
+    scenario, deadline
+):
+    s = scenario
+    if deadline == "start":
+        s.config.starts_at = datetime.fromtimestamp(100.125, timezone.utc)
+    elif deadline == "attempt":
+        s.coordinator.next_attempt_at = 100.125
+    elif deadline == "account":
+        s.coordinator.account_ready_at = {"A": 100.125, "B": 110}
+    elif deadline == "poll":
+        known_order(s, s.config.people)
+        s.coordinator.next_order_poll_at = 100.125
+    else:
+        s.config.ends_at = datetime.fromtimestamp(100.125, timezone.utc)
+        s.coordinator.next_attempt_at = 110
+    assert s.coordinator._wait_seconds() == pytest.approx(0.125)

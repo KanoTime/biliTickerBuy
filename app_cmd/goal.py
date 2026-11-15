@@ -5,9 +5,11 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import platform
 import signal
 import sys
 import threading
+import time
 import webbrowser
 from pathlib import Path
 
@@ -57,6 +59,18 @@ def _executors(config):
     }
 
 
+def _person_order(value: str) -> tuple[int, int, int]:
+    try:
+        positions = tuple(int(part.strip()) for part in value.split(","))
+    except ValueError:
+        positions = ()
+    if sorted(positions) != [1, 2, 3]:
+        raise argparse.ArgumentTypeError(
+            "请填写本机核对后的 B 账号人员位置，例如 2,1,3；每个位置恰好一次"
+        )
+    return positions
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="固定日期票档、固定购票人的 B站个人购买目标"
@@ -65,6 +79,18 @@ def build_parser() -> argparse.ArgumentParser:
     commands.add_parser("demo", help="离线演示三人优先、分批及回流，不连接平台")
     template = commands.add_parser("template", help="生成本机目标配置模板")
     template.add_argument("--output", default="btb_goal_data/goal.toml")
+    imported = commands.add_parser(
+        "import-exports", help="从两份本机导出填写 UID 和购票人映射，不连接平台"
+    )
+    imported.add_argument("--account-a", required=True)
+    imported.add_argument("--account-b", required=True)
+    imported.add_argument("--ends-at", required=True)
+    imported.add_argument("--output", default="btb_goal_data/goal.toml")
+    imported.add_argument(
+        "--b-order",
+        type=_person_order,
+        help="本机核对后，B 导出中分别对应 A 的 P1/P2/P3 的位置，例如 2,1,3",
+    )
     for name, help_text in (
         ("validate", "仅检查本地配置，不连接平台"),
         ("preflight", "只读核对登录账号和当前目标，不提交订单"),
@@ -107,7 +133,7 @@ def _write_template(path: Path) -> None:
     _print_json(
         {
             "template": str(path),
-            "message": "请在本机填写两个账号导出文件、UID、购票人映射、场次票档及结束时间",
+            "message": "本场目标已预填；请填写账号导出、UID、人员映射及结束时间，或用 import-exports 从导出生成配置",
         }
     )
 
@@ -115,18 +141,30 @@ def _write_template(path: Path) -> None:
 def _read_only_preflight(config) -> int:
     executors = _executors(config)
     checks = []
+    started = time.perf_counter()
     try:
         for account in config.accounts:
+            account_started = time.perf_counter()
             try:
                 result = executors[account.key].preflight()
                 ready = result.ready and str(result.account_uid) == account.uid
                 checks.append(
-                    {"account": account.key, "ready": ready, "reason": result.reason}
+                    {
+                        "account": account.key,
+                        "ready": ready,
+                        "reason": result.reason
+                        or ("" if ready else "登录账号与配置不一致"),
+                        "retryable": result.retryable,
+                        "retry_after": result.retry_after,
+                    }
                 )
             except Exception:
                 checks.append(
                     {"account": account.key, "ready": False, "reason": "只读预检未完成"}
                 )
+            checks[-1]["elapsed_ms"] = round(
+                (time.perf_counter() - account_started) * 1000, 1
+            )
     finally:
         for executor in executors.values():
             executor.close()
@@ -137,6 +175,12 @@ def _read_only_preflight(config) -> int:
             "mode": "read_only_preflight",
             "checks": checks,
             "goal": config.public_summary(),
+            "elapsed_ms": round((time.perf_counter() - started) * 1000, 1),
+            "environment": {
+                "system": platform.system(),
+                "machine": platform.machine(),
+                "python": platform.python_version(),
+            },
         }
     )
     return 0 if ok else 2
@@ -181,6 +225,19 @@ def main(argv=None) -> int:
             return 0
         if args.command == "template":
             _write_template(Path(args.output))
+            return 0
+        if args.command == "import-exports":
+            from task.goal_setup import import_ticket_exports
+
+            _print_json(
+                import_ticket_exports(
+                    account_a=args.account_a,
+                    account_b=args.account_b,
+                    ends_at=args.ends_at,
+                    output=args.output,
+                    b_order=args.b_order,
+                )
+            )
             return 0
         config = load_goal_config(args.config)
         if args.command == "validate":

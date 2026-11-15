@@ -36,6 +36,8 @@
 
 本 fork 的个人目标版本使用独立入口 `python -m app_cmd.goal`，支持两个账号共用购票人状态、三人优先、分批补齐、回流等待和重启恢复。先运行离线演示，再按[本机使用指南](./docs/personal-goal.md)配置和进行只读预检。该入口的自动订单核验仍需结合当前账号回包验证，详见[接口证据与边界](./docs/goal-api-evidence.md)。
 
+已有两份账号导出时可用 `import-exports` 自动填写 UID 和购票人映射。准备交由本机 Codex 连续执行时，使用 [Mac 本机执行委托](./docs/mac-commissioning.md)；本轮对购票机会和实际可运行性的审查见[准备情况复核](./docs/goal-readiness-review.md)。
+
 ## 👀 使用说明书
 
 前往飞书： https://n1x87b5cqay.feishu.cn/wiki/Eg4xwt3Dbiah02k1WqOcVk2YnMd

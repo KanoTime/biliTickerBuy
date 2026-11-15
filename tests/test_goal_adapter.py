@@ -32,11 +32,14 @@ class FakeRequest:
     def __init__(self, source):
         self.nav = {"code": 0, "data": {"mid": 9001, "isLogin": True}}
         self.buyers = copy.deepcopy(source["buyer_info"])
+        self.buyers_response = None
         self.prepare_responses = []
         self.create_responses = []
         self.prepares = []
         self.creates = []
         self.gets = []
+        self.calls = []
+        self.clock = [100.0]
         self.order_info = {"errno": 0, "data": {}}
         self.order_list = {"errno": 0, "data": {"list": []}}
         self.before_post = None
@@ -50,18 +53,25 @@ class FakeRequest:
     def get(self, *, url, **_):
         self.gets.append(url)
         if url == module.NAV_URL:
+            self.calls.append("nav")
             return self.respond(self.nav)
         if "/buyer/list" in url:
+            self.calls.append("buyers")
+            if self.buyers_response is not None:
+                return self.respond(self.buyers_response)
             return Response({"errno": 0, "data": {"list": self.buyers}})
         if "/order/info?" in url:
+            self.calls.append("order_info")
             return self.respond(self.order_info)
         if "/order/list?" in url:
+            self.calls.append("order_list")
             return self.respond(self.order_list)
         raise AssertionError("unexpected read-only route")
 
     def post(self, *, url, data, isJson):
         assert isJson is True
         if "/order/prepare?" in url:
+            self.calls.append("prepare")
             self.prepares.append(copy.deepcopy(data))
             item = (
                 self.prepare_responses.pop(0)
@@ -73,6 +83,7 @@ class FakeRequest:
             )
             return self.respond(item)
         assert "/order/createV2?" in url
+        self.calls.append("create")
         if self.before_post is not None:
             self.before_post()
         self.creates.append(copy.deepcopy(data))
@@ -147,10 +158,15 @@ def account_adapter(monkeypatch):
             }
         ],
     }
-    monkeypatch.setattr(
-        module, "fetch_project_payload", lambda **_: copy.deepcopy(project)
+
+    def read_project(**_):
+        request.calls.append("target")
+        return copy.deepcopy(project)
+
+    monkeypatch.setattr(module, "fetch_project_payload", read_project)
+    adapter = module.BiliGoalAccount(
+        account, target, request=request, monotonic=lambda: request.clock[0]
     )
-    adapter = module.BiliGoalAccount(account, target, request=request)
     return adapter, request, project
 
 
@@ -234,6 +250,175 @@ def test_prepare_and_submit_use_exact_fresh_attendee_group(account_adapter):
     assert all("cookies" not in payload for payload in request.creates)
 
 
+def test_warm_attempts_reuse_identity_but_read_target_and_prepare_every_time(
+    account_adapter,
+):
+    adapter, request, _ = account_adapter
+    assert adapter.preflight().ready
+    assert request.calls == ["nav", "target", "buyers"]
+    request.calls.clear()
+
+    first = adapter.attempt(("P1", "P2"), lambda: None)
+    second = adapter.attempt(("P3",), lambda: None)
+
+    assert first.outcome == second.outcome == "created"
+    assert request.calls == ["target", "prepare", "create"] * 2
+    assert [payload["token"] for payload in request.creates] == [
+        "fresh-token-1",
+        "fresh-token-2",
+    ]
+
+
+def test_identity_cache_expires_on_monotonic_clock_and_preflight_forces_refresh(
+    account_adapter,
+):
+    adapter, request, _ = account_adapter
+    assert adapter.preflight().ready
+    request.calls.clear()
+    request.clock[0] += 29.0
+    assert adapter.attempt(("P3",), lambda: None).outcome == "created"
+    assert request.calls == ["target", "prepare", "create"]
+
+    request.calls.clear()
+    request.clock[0] += 1.0
+    assert adapter.attempt(("P3",), lambda: None).outcome == "created"
+    assert request.calls == ["nav", "target", "buyers", "prepare", "create"]
+
+    request.calls.clear()
+    assert adapter.preflight().ready
+    assert request.calls == ["nav", "target", "buyers"]
+
+
+def test_selected_people_preflight_ignores_completed_persons_eligibility(
+    account_adapter,
+):
+    adapter, request, _ = account_adapter
+    request.buyers[0]["error_code"] = 100048
+    request.buyers[1]["error_code"] = 100048
+
+    assert adapter.preflight(person_keys=("P3",)).ready
+    assert request.calls == ["nav", "target", "buyers"]
+    request.calls.clear()
+    assert adapter.attempt(("P3",), lambda: None).outcome == "created"
+    assert request.calls == ["target", "prepare", "create"]
+    assert json.loads(request.creates[0]["buyer_info"])[0]["id"] == 103
+
+    # A full explicit preflight still reports invalid eligibility for its roster.
+    assert adapter.preflight().ready is False
+
+
+def test_cold_partial_attempt_checks_only_its_current_people(account_adapter):
+    adapter, request, _ = account_adapter
+    request.buyers[0]["error_code"] = 100048
+    request.buyers[1]["error_code"] = 100048
+    assert adapter.attempt(("P3",), lambda: None).outcome == "created"
+    assert request.calls == ["nav", "target", "buyers", "prepare", "create"]
+
+
+def test_empty_preflight_does_not_check_unneeded_buyer_roster(account_adapter):
+    adapter, request, _ = account_adapter
+    request.buyers_response = {"errno": 0, "data": {"list": None}}
+    assert adapter.preflight(person_keys=()).ready
+    assert request.calls == ["nav", "target"]
+    assert not request.prepares and not request.creates
+
+
+def test_per_person_cache_does_not_cover_unchecked_people(account_adapter):
+    adapter, request, _ = account_adapter
+    assert adapter.preflight(person_keys=("P1",)).ready
+    request.calls.clear()
+    request.buyers[1]["personal_id"] = "CHANGED PRIVATE IDENTITY"
+    result = adapter.attempt(("P2",), lambda: pytest.fail("must not submit"))
+    assert result.outcome == "blocked"
+    assert request.calls == ["target", "buyers"]
+    assert not request.prepares and not request.creates
+
+
+def test_target_price_drift_still_blocks_with_fresh_identity_cache(account_adapter):
+    adapter, request, project = account_adapter
+    assert adapter.preflight().ready
+    request.calls.clear()
+    project["screen_list"][0]["ticket_list"][0]["price"] += 100
+    result = adapter.attempt(("P3",), lambda: pytest.fail("must not submit"))
+    assert result.outcome == "blocked"
+    assert result.blocked_scope == "goal"
+    assert request.calls == ["target"]
+    assert not request.prepares and not request.creates
+
+
+@pytest.mark.parametrize("endpoint", ["nav", "buyers"])
+@pytest.mark.parametrize(
+    "response",
+    [
+        {"code": -500, "data": {}},
+        {"code": 0, "data": None},
+        {"code": 0, "data": {}},
+        [],
+    ],
+)
+def test_transient_read_business_or_structure_failure_can_recover(
+    account_adapter, endpoint, response
+):
+    adapter, request, _ = account_adapter
+    original_nav = copy.deepcopy(request.nav)
+    if endpoint == "nav":
+        request.nav = response
+    else:
+        request.buyers_response = response
+
+    result = adapter.attempt(("P3",), lambda: pytest.fail("must not submit"))
+    assert result.outcome == "retry"
+    assert result.definitive_no_order
+    assert result.retry_after == 3.0
+    assert not request.prepares and not request.creates
+
+    request.nav = original_nav
+    request.buyers_response = None
+    request.calls.clear()
+    assert adapter.attempt(("P3",), lambda: None).outcome == "created"
+    assert request.calls == ["nav", "target", "buyers", "prepare", "create"]
+
+
+@pytest.mark.parametrize("failure", ["login", "uid", "identity", "auth_code"])
+def test_explicit_identity_failure_invalidates_recent_success(account_adapter, failure):
+    adapter, request, _ = account_adapter
+    assert adapter.preflight().ready
+    original_nav = copy.deepcopy(request.nav)
+    original_buyers = copy.deepcopy(request.buyers)
+    if failure == "login":
+        request.nav["data"]["isLogin"] = False
+    elif failure == "uid":
+        request.nav["data"]["mid"] = 9002
+    elif failure == "identity":
+        request.buyers[2]["personal_id"] = "CHANGED PRIVATE IDENTITY"
+    else:
+        request.buyers_response = {"errno": -101, "data": {}}
+    result = adapter.preflight(person_keys=("P3",))
+    assert result.ready is False
+    assert result.retryable is False
+
+    request.nav = original_nav
+    request.buyers = original_buyers
+    request.buyers_response = None
+    request.calls.clear()
+    assert adapter.attempt(("P3",), lambda: None).outcome == "created"
+    assert request.calls == ["nav", "target", "buyers", "prepare", "create"]
+
+
+def test_reconcile_reuses_recent_uid_but_does_not_cache_order_state(account_adapter):
+    adapter, request, _ = account_adapter
+    assert adapter.preflight().ready
+    request.order_info = {"errno": 0, "data": official_order()}
+    request.calls.clear()
+    assert adapter.reconcile(pending_attempt()).status == "paid"
+    assert adapter.reconcile(pending_attempt()).status == "paid"
+    assert request.calls == ["order_info", "order_info"]
+    request.clock[0] += 30.0
+    request.calls.clear()
+    assert adapter.reconcile(pending_attempt()).status == "paid"
+    assert request.calls == ["nav", "order_info"]
+
+
 def test_ledger_or_cancellation_boundary_failure_never_sends(account_adapter):
     adapter, request, _ = account_adapter
 
@@ -276,6 +461,47 @@ def test_create_error_classification_never_mutates_price_or_retries_inside_attem
     assert adapter.account.ticket_config["pay_money"] == 59400
 
 
+@pytest.mark.parametrize("stage", ["prepare", "create"])
+@pytest.mark.parametrize("code", [100016, 100017])
+def test_currently_unsaleable_keeps_group_for_next_fresh_target_attempt(
+    account_adapter, stage, code
+):
+    adapter, request, _ = account_adapter
+    getattr(request, f"{stage}_responses").append({"errno": code, "data": {}})
+    people = ("P1", "P2", "P3")
+    result = adapter.attempt(people, lambda: None)
+    assert result.outcome == "retry"
+    assert result.definitive_no_order is True
+    assert result.retry_after == 5.0
+    assert result.blocked_scope == "account"
+    assert len(request.prepares) == 1
+    assert len(request.creates) == (1 if stage == "create" else 0)
+
+    # The scheduler performs the delay; the adapter never sleeps or replays
+    # internally. A later permitted attempt refreshes the target and prepare.
+    request.clock[0] += result.retry_after
+    request.calls.clear()
+    assert adapter.attempt(people, lambda: None).outcome == "created"
+    assert request.calls == ["target", "prepare", "create"]
+    assert [payload["count"] for payload in request.prepares] == [3, 3]
+    assert all(payload["count"] == 3 for payload in request.creates)
+    assert all(payload["pay_money"] == 59400 for payload in request.creates)
+    assert request.creates[-1]["token"] == "fresh-token-2"
+
+
+@pytest.mark.parametrize("stage", ["prepare", "create"])
+def test_explicit_event_ended_remains_terminal(account_adapter, stage):
+    adapter, request, _ = account_adapter
+    getattr(request, f"{stage}_responses").append({"errno": 100039, "data": {}})
+    result = adapter.attempt(("P1", "P2", "P3"), lambda: None)
+    assert result.outcome == "blocked"
+    assert result.blocked_scope == "goal"
+    assert result.definitive_no_order is True
+    assert result.retry_after == 0.0
+    assert len(request.prepares) == 1
+    assert len(request.creates) == (1 if stage == "create" else 0)
+
+
 @pytest.mark.parametrize(
     "response",
     [
@@ -289,6 +515,8 @@ def test_create_error_classification_never_mutates_price_or_retries_inside_attem
         RequestException("PRIVATE REQUEST DETAILS"),
         Response({}, 412),
         {"errno": 100009, "data": {"orderId": 12345}},
+        {"errno": 100016, "data": {"orderId": 12345}},
+        {"errno": 100017, "data": {"orderId": 12345}},
     ],
 )
 def test_uncertain_create_is_single_send_and_freezes_group(account_adapter, response):

@@ -191,6 +191,44 @@ def test_real_help_process_is_local_and_does_not_import_legacy_util(tmp_path):
     assert "preflight" in result.stdout
     assert "confirm" in result.stdout
     assert "demo" in result.stdout
+    assert "import-exports" in result.stdout
+
+
+def test_real_export_import_uses_local_identity_matching_without_network(
+    local_cli_goal, tmp_path
+):
+    _, _, sources = local_cli_goal
+    for key, source in sources.items():
+        source["screen_id"] = 1035758
+        source["sku_id"] = 960028
+        if key == "B":
+            source["buyer_info"].reverse()
+        (tmp_path / f"account-{key}.json").write_text(json.dumps(source))
+    destination = tmp_path / "imported" / "goal.toml"
+    result = _offline_subprocess(
+        tmp_path,
+        [
+            "import-exports",
+            "--account-a",
+            str(tmp_path / "account-A.json"),
+            "--account-b",
+            str(tmp_path / "account-B.json"),
+            "--ends-at",
+            "2026-11-15T23:00:00+08:00",
+            "--output",
+            str(destination),
+        ],
+    )
+    config = load_goal_config(destination)
+    assert config.account("A").uid == "9001"
+    assert dict(config.account("B").buyer_ids) == {
+        "P1": "201",
+        "P2": "202",
+        "P3": "203",
+    }
+    assert "PRIVATE-" not in result.stdout
+    assert "PRIVATE-" not in destination.read_text()
+    assert not config.state_path.exists()
 
 
 def test_real_demo_process_finishes_partial_return_flow_without_network(tmp_path):
@@ -406,6 +444,10 @@ def test_preflight_uses_only_read_business_operations_and_closes_clients(
     output = json.loads(capsys.readouterr().out)
     assert output["mode"] == "read_only_preflight"
     assert all(check["ready"] for check in output["checks"])
+    assert all(check["elapsed_ms"] >= 0 for check in output["checks"])
+    assert output["elapsed_ms"] >= 0
+    assert output["environment"]["system"]
+    assert output["environment"]["machine"]
     assert calls
     assert all("/order/" not in url for _, url in calls)
     assert all(request.closed for request in requests)

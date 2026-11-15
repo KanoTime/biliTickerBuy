@@ -70,7 +70,7 @@ def run_demo(event_sink=None):
         def __init__(self, account):
             self.account = account
 
-        def preflight(self):
+        def preflight(self, *, person_keys=None):
             return PreflightResult(True, account_uid=self.account.uid)
 
         def attempt(self, people, before_submit):
